@@ -1,7 +1,9 @@
 import os
 import sys
 import uuid
+import wandb
 
+log_wandb = False
 run_id = f"v2 - 01-06 - {str(uuid.uuid4())[0:5]}"
 
 
@@ -941,6 +943,7 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
     key_offset: bool
+    value_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
@@ -951,6 +954,7 @@ flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_inte
 if True:
     smear_dims = (0, 12)
     skip_dims = (6, 18)
+    backout_dims = (6, 18)
     attn_dims = (18, 30)
     ve_dims = (18, 30)
 else:
@@ -958,6 +962,7 @@ else:
     skip_dims = (0, 12)
     attn_dims = (0, 12)
     ve_dims = (0, 12)
+    backout_dims = (0, 12)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1085,6 +1090,11 @@ class GPT(nn.Module):
         self.skip_gate.weight.lr_mul = 0.05
         self.skip_gate.weight.wd_mul = 0.0
 
+        self.backout_gate = CastedLinear(12, 1)
+        self.backout_gate.weight.label = 'backout_gate'
+        self.backout_gate.weight.lr_mul = 0.05
+        self.backout_gate.weight.wd_mul = 0.0
+
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -1125,7 +1135,7 @@ class GPT(nn.Module):
                     1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
-                    0.5*torch.ones(1), # backout_lambda
+                    0.4*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
                 ]
@@ -1149,6 +1159,7 @@ class GPT(nn.Module):
         # Assert gate sizes match dims
         assert self.smear_gate.weight.size(-1) == smear_dims[1] - smear_dims[0]
         assert self.skip_gate.weight.size(-1) == skip_dims[1] - skip_dims[0]
+        assert self.backout_gate.weight.size(-1) == backout_dims[1] - backout_dims[0]
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1231,7 +1242,11 @@ class GPT(nn.Module):
                 x_backout = x
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda * x_backout
+        # content-gated backout (GRU reset-gate style) - makes backout position/content-aware
+        # clone the slice to avoid view aliasing issues with torch.compile
+        dx = x - x_backout
+        backout_gate_out = 2 * backout_lambda * torch.sigmoid(self.backout_gate(dx[..., backout_dims[0]:backout_dims[1]]))
+        x = x - backout_gate_out * x_backout
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
@@ -1509,7 +1524,7 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
 
-        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'attn_gate_bank', 've_gate_bank', 'skip_gate', 'x0_lambdas', 'embed']
+        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'attn_gate_bank', 've_gate_bank', 'skip_gate', 'backout_gate', 'x0_lambdas', 'embed']
         scalar_labels = ['scalars']
         muon_labels = ['attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
@@ -1697,6 +1712,8 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    if log_wandb:
+        wandb.init(project="modded-nanogpt", name=run_id)
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -1873,6 +1890,15 @@ for repeat_idx in range(num_repeats):
         # logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        if master_process and log_wandb:
+            step_lr = get_lr(step)
+            wandb.log({
+                "backout_gate/mean": model.backout_gate.weight.mean().item(),
+                "backout_gate/std": model.backout_gate.weight.std().item(),
+                "backout_lambda": model.scalars[3 * 11 + 1].item(),  # num_layers=11
+                "lr/backout_gate": 0.008 * step_lr * 0.05,  # adam_lr * step_lr * lr_mul
+                "lr/backout_lambda": 0.008 * step_lr * 5.0,  # scalar_lr * step_lr * lr_mul
+            }, step=step)
 
         # prof_ctx.step()
 
