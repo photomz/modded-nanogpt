@@ -497,6 +497,52 @@ class NorMuon(torch.optim.Optimizer):
         else:
             param_groups = self.generate_standard_param_groups(params)
         super().__init__(param_groups, defaults)
+        
+        # Backward hooks state (mirrors DistAdam pattern)
+        self.should_sync = False
+        self._reduce_scatter_futures = {}
+        self._grad_counts = [0] * len(param_groups)
+        self._stacked_grads = []
+        self._grad_chunks = []
+        self._pending_gathers = []
+        self._init_buffers()
+        self.register_backward_hooks()
+
+    def _init_buffers(self):
+        """Pre-allocate gradient buffers for each param group."""
+        for group in self.param_groups:
+            params = group["params"]
+            padded = group["chunk_size"] * self.world_size
+            stacked = torch.empty((padded, *params[0].shape), dtype=params[0].dtype, device=params[0].device)
+            self._stacked_grads.append(stacked)
+            self._grad_chunks.append(torch.empty_like(stacked[:group["chunk_size"]]))
+
+    def register_backward_hooks(self):
+        """Register hooks to launch reduce_scatter during backward pass."""
+        for group_idx, group in enumerate(self.param_groups):
+            group_len = len(group["params"])
+            for idx, param in enumerate(group["params"]):
+                param.register_post_accumulate_grad_hook(
+                    lambda p, gi=group_idx, i=idx, gl=group_len: self._sync_gradient(p, gi, i, gl)
+                )
+
+    @torch.no_grad()
+    def _sync_gradient(self, param, group_idx, idx, group_len):
+        """Called when a param's gradient is ready. Batches grads and launches reduce_scatter."""
+        if not self.should_sync:
+            return
+        
+        self._stacked_grads[group_idx][idx].copy_(param.grad, non_blocking=True)
+        self._grad_counts[group_idx] += 1
+        
+        # When all grads for this group are ready, launch reduce_scatter
+        if self._grad_counts[group_idx] == group_len:
+            stacked = self._stacked_grads[group_idx]
+            if group_len < stacked.shape[0]:
+                stacked[group_len:].zero_()
+            self._reduce_scatter_futures[group_idx] = dist.reduce_scatter_tensor(
+                self._grad_chunks[group_idx], stacked, op=dist.ReduceOp.AVG, async_op=True
+            ).get_future()
 
     def reset(self):
         # expose a reset for clearing buffers
@@ -546,42 +592,17 @@ class NorMuon(torch.optim.Optimizer):
     def step(self):
         # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
         # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
+        # Option B: reduce_scatter already launched via backward hooks
         rank = dist.get_rank()
-        group_infos = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            if not params:
-                continue
-
-            chunk_size = group["chunk_size"]
-            padded_num_params = chunk_size * self.world_size
-
-            stacked_grads = torch.empty(
-                (padded_num_params, *params[0].shape),
-                dtype=params[0].dtype,
-                device=params[0].device
-            )
-            for i, p in enumerate(params):
-                stacked_grads[i].copy_(p.grad, non_blocking=True)
-            if len(params) < padded_num_params:
-                stacked_grads[len(params):].zero_()
-
-            grad_chunk = torch.empty_like(stacked_grads[:chunk_size])
-
-            reduce_future = dist.reduce_scatter_tensor(
-                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
-            ).get_future()
-
-            group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
 
         all_gather_infos = []
-        # Second pass: wait for gradients, compute updates for the local shard of parameters,
-        # and launch all async all_gather operations.
-        for group, info in zip(self.param_groups, group_infos):
-            info["reduce_future"].wait()
+        # Wait for reduce_scatter (launched during backward), compute updates, launch all_gather
+        for group_idx, group in enumerate(reversed(self.param_groups)):
+            # Wait for reduce_scatter that was launched during backward
+            self._reduce_scatter_futures[group_idx].wait()
 
             params = group["params"]
-            grad_chunk = info["grad_chunk"]
+            grad_chunk = self._grad_chunks[group_idx]
             chunk_size = group["chunk_size"]
             padded_num_params = chunk_size * self.world_size
 
@@ -601,7 +622,7 @@ class NorMuon(torch.optim.Optimizer):
             if params[module_idx].label == 'attn':
 
                 for p in params[module_idx:module_idx + num_params]:
-                    assert p.label == 'attn'
+                    assert p.label == 'attn'    
 
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
 
@@ -693,23 +714,23 @@ class NorMuon(torch.optim.Optimizer):
                 stacked_params, updated_params, async_op=True
             ).get_future()
 
-            all_gather_infos.append(
-                {
-                    "gather_future": gather_future,
-                    "stacked_params": stacked_params,
-                    "orig_params": params,
-                }
-            )
+            all_gather_infos.append((gather_future, stacked_params, params))
 
-        # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
-        for info in all_gather_infos:
-            info["gather_future"].wait()
-            stacked_params = info["stacked_params"]
-            orig_params = info["orig_params"]
+        # Reset for next step
+        for i in range(len(self._grad_counts)):
+            self._grad_counts[i] = 0
+        self._reduce_scatter_futures.clear()
 
-            unstacked_params = torch.unbind(stacked_params)
+        self._pending_gathers = all_gather_infos
+        return [f for f, _, _ in all_gather_infos]
+
+    @torch.no_grad()
+    def finalize(self):
+        """Copy gathered params back after external sync."""
+        for _, stacked_params, orig_params in self._pending_gathers:
             for i, p in enumerate(orig_params):
-                p.copy_(unstacked_params[i], non_blocking=True)
+                p.copy_(stacked_params[i], non_blocking=True)
+        self._pending_gathers = []
 
 
 class DistAdam(torch.optim.Optimizer):
@@ -853,7 +874,7 @@ class DistAdam(torch.optim.Optimizer):
                     all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
 
         self._reduce_scatter_futures.clear()
-        torch.futures.collect_all(all_gather_futures).wait()
+        return all_gather_futures
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
