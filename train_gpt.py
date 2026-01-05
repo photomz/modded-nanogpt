@@ -997,6 +997,12 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# Residual dim split.
+smear_dims = (0, 12)
+skip_dims = (6, 18)
+attn_dims = (18, 30)
+ve_dims = (18, 30)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
@@ -1039,7 +1045,7 @@ class CausalSelfAttention(nn.Module):
             k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
             k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
         if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
+            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
@@ -1049,7 +1055,7 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(F.linear(x[..., attn_dims[0]:attn_dims[1]], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1181,6 +1187,10 @@ class GPT(nn.Module):
         self.scalars.wd_mul = 0.0
 
         self.split_embed = False
+        
+        # Assert gate sizes match dims
+        assert self.smear_gate.weight.size(-1) == smear_dims[1] - smear_dims[0]
+        assert self.skip_gate.weight.size(-1) == skip_dims[1] - skip_dims[0]
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1222,7 +1232,7 @@ class GPT(nn.Module):
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, smear_dims[0]:smear_dims[1]]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
@@ -1248,7 +1258,7 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i]
             )
             if i in skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., skip_dims[0]:skip_dims[1]]))
                 x = x + skip_gate_out * skip_connections.pop()
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x
