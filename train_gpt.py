@@ -1232,7 +1232,6 @@ class GPT(nn.Module):
         bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
-        value_offset = [b==long_bm for b in bm_sizes] # apply partial value offset to long windows
 
         # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
         if self.split_embed:
@@ -1268,7 +1267,6 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale,
                 key_offset=key_offset[i],
-                value_offset=value_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
             )
