@@ -18,6 +18,7 @@ from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
 import gc
+from pushover import send_pushover
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -36,6 +37,10 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
+
+# env var
+TREATMENT = int(os.environ.get("TREATMENT", 0))
+TITLE = os.environ.get("TITLE", "A Run")
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -1003,7 +1008,7 @@ flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_inte
 
 # Residual dim split.
 # @photo_mz No loss change, miniscule inductive bias.
-if True:
+if TREATMENT:
     smear_dims = (0, 12)
     skip_dims = (6, 18)
     attn_dims = (18, 30)
@@ -1151,7 +1156,13 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(6, num_heads, 12)) # 3 layers
+        
+        if TREATMENT:
+            ve_gate_bank_size = 6
+        else:
+            ve_gate_bank_size = 5
+        
+        self.ve_gate_bank = nn.Parameter(torch.zeros(ve_gate_bank_size, num_heads, 12)) # 3 layers
         self.ve_gate_bank.label = 've_gate_bank'
 
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
@@ -1241,7 +1252,10 @@ class GPT(nn.Module):
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer and shifting updates this to 012 ... 012
-        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        if TREATMENT:
+            ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        else:
+            ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1253,7 +1267,10 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
+        if TREATMENT:
+            ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
+        else:
+            ve_gates = [veg[1], veg[2]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1710,7 +1727,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1800  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = int(os.environ.get("NUM_ITERATIONS", 1800))  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1750,12 +1767,16 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
-def print0(s, console=False):
+def print0(s, console=False, push=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
+            if push:
+                send_pushover(s, TITLE)
             print(s, file=f)
+def p_normal(std_mean):
+    return f"N({std_mean[1].item():.4f}, {std_mean[0].item():.4f})"
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1825,7 +1846,7 @@ for repeat_idx in range(num_repeats):
     ########################################
     #            Warmup kernels            #
     ########################################
-    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True, push=True)
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                         optimizers=training_manager.get_state()) # save the initial state
@@ -1910,6 +1931,10 @@ for repeat_idx in range(num_repeats):
                 log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in training_manager.optimizers])
                 os.makedirs(f"logs/{run_id}", exist_ok=True)
                 torch.save(log, f"logs/{run_id}/state_step{step:06d}_repeat{repeat_idx}.pt")
+            if master_process:
+                p_loss = p_normal(torch.std_mean(torch.tensor(loss_reps)))
+                p_time = p_normal(torch.std_mean(torch.tensor(time_reps)))
+                print0(f"Loss {p_loss}, time {p_time} \n\n Losses: {loss_reps} \n Times: {time_reps}", push=True, console=True)
             # the last step only has the validation loop, so break to avoid training
             break
 
@@ -1925,14 +1950,12 @@ for repeat_idx in range(num_repeats):
 
         # logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=step % 10 == 0)
 
         # prof_ctx.step()
 
     # prof_ctx.__exit__(None, None, None)
 
-print0(f"loss_reps: {loss_reps}, mean = {(sum(loss_reps) / len(loss_reps)):.4f}", console=True)
-print0(f"time_reps: {time_reps}, mean = {(sum(time_reps) / len(time_reps) / 1000):.2f}s", console=True)
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
