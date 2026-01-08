@@ -7,7 +7,6 @@ ENV PATH=/usr/local/bin:$PATH
 RUN apt update && apt install -y --no-install-recommends build-essential libssl-dev zlib1g-dev \
     libbz2-dev libreadline-dev libsqlite3-dev curl git libncursesw5-dev xz-utils tk-dev libxml2-dev \
     libxmlsec1-dev libffi-dev liblzma-dev \
-    openssh-server \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
 RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
