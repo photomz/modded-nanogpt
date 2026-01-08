@@ -56,7 +56,8 @@ To run the current record, run the following commands.
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 pip install torch==2.10.0.dev20251210+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126
-python3 data/cached_fineweb10B.py 9
+# downloads only the first 900M training tokens to save time
+python data/cached_fineweb10B.py 9
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.

@@ -10,16 +10,6 @@ RUN apt update && apt install -y --no-install-recommends build-essential libssl-
     openssh-server \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Configure SSH
-RUN mkdir -p /var/run/sshd && \
-sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \
-sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd && \
-ssh-keygen -A
-
-# Create SSH directory for root
-RUN mkdir -p /root/.ssh && \
-chmod 700 /root/.ssh
-
 RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
     tar -xzf Python-${PYTHON_VERSION}.tgz && \
     cd Python-${PYTHON_VERSION} && \
